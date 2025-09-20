@@ -77,7 +77,7 @@ class Net2NetTransformer(pl.LightningModule):
             model.train = disabled_train
             self.cond_stage_model = model
 
-    def forward(self, x, c):
+    def forward(self, x, c, z=None):
         # one step to produce the logits
         _, z_indices = self.encode_to_z(x)
         _, c_indices = self.encode_to_c(c)
@@ -96,8 +96,11 @@ class Net2NetTransformer(pl.LightningModule):
         # target includes all sequence elements (no need to handle first one
         # differently because we are conditioning)
         target = z_indices
-        # make the prediction
-        logits, _ = self.transformer(cz_indices[:, :-1])
+        # make the prediction - pass z to transformer if provided
+        if z is not None:
+            logits, _ = self.transformer(cz_indices[:, :-1], z=z)
+        else:
+            logits, _ = self.transformer(cz_indices[:, :-1])
         # cut off conditioning outputs - output i corresponds to p(z_i | z_{<i}, c)
         logits = logits[:, c_indices.shape[1]-1:]
 

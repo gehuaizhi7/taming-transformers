@@ -1,0 +1,65 @@
+model:
+  base_learning_rate: 1e-5  # Increased from 4.5e-06 (2x increase)
+  target: taming.models.cond_transformer.Net2NetTransformer
+  params:
+    unconditional: true  # Enable unconditional training
+    sos_token: 0         # Start-of-sequence token
+    first_stage_key: image
+    cond_stage_key: image  # Same as first stage for unconditional
+    transformer_config:
+      target: taming.modules.transformer.custom_gpt.CustomGPT
+      params:
+        vocab_size: 16384
+        block_size: 512
+        n_layer: 24  # L - number of layers (and z vectors)
+        n_head: 16
+        n_embd: 1024
+        z_dim: 512  # Latent vector dimension (can be different from n_embd)
+    first_stage_config:
+      target: taming.models.vqgan.VQModel
+      params:
+        ckpt_path: pretrained/vqgan_imagenet_f16_16384.ckpt
+        embed_dim: 256
+        n_embed: 16384
+        ddconfig:
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 16
+          dropout: 0.0
+        lossconfig:
+          target: taming.modules.losses.DummyLoss
+    cond_stage_config: "__is_unconditional__"  # Special flag for unconditional training
+
+variational:
+  eta_fast: 2e-3    # Increased from 1e-3 (2x increase)
+  eta_slow: 2e-4    # Increased from 1e-4 (2x increase)
+  T_fast: 8         # Increased from 5 (1.6x increase)
+  beta: 0.5         # KL loss weight (β-VAE parameter)
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 32
+    num_workers: 8
+    train:
+      target: taming.data.celebahq_10k.CelebAHQ10KTrain
+      params:
+        size: 256
+        crop_size: 256
+    validation:
+      target: taming.data.celebahq_10k.CelebAHQ10KValidation
+      params:
+        size: 256
+        crop_size: 256

@@ -1,0 +1,10 @@
+data/celebahq_tiny/validation/107592.png
+data/celebahq_tiny/validation/103333.png
+data/celebahq_tiny/validation/125114.png
+data/celebahq_tiny/validation/038907.png
+data/celebahq_tiny/validation/056668.png
+data/celebahq_tiny/validation/032822.png
+data/celebahq_tiny/validation/106014.png
+data/celebahq_tiny/validation/076883.png
+data/celebahq_tiny/validation/053814.png
+data/celebahq_tiny/validation/038473.png
