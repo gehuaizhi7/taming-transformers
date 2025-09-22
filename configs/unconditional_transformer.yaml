@@ -45,8 +45,8 @@ model:
 variational:
   eta_fast: 2e-3    # Increased from 1e-3 (2x increase)
   eta_slow: 2e-4    # Increased from 1e-4 (2x increase)
-  T_fast: 8         # Increased from 5 (1.6x increase)
-  beta: 0.5         # KL loss weight (β-VAE parameter)
+  T_fast: 12         # Increased from 5 (1.6x increase)
+  beta: 0.7         # KL loss weight (β-VAE parameter)
 
 data:
   target: main.DataModuleFromConfig

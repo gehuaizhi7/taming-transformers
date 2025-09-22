@@ -128,6 +128,10 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
     # For unconditional training, use full sequence
     y_in  = z_indices  # full sequence as input
     y_tgt = z_indices  # full sequence as target
+    
+    # Teacher forcing alignment: logits at position t predict token at position t+1
+    # logits shape: (B, S, V), target should be (B, S) starting from position 1
+    y_tgt_shifted = y_tgt[:, 1:]  # Remove first token: [token_1, token_2, ..., token_S]
     B = y_in.size(0)
 
     # ---- 1) Fast variables: mu, log_var for L layers ----
@@ -141,10 +145,13 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
 
         z_per_layer = variational.sample_z(mu, log_var)             # (B, L, z_dim)
         # For unconditional training, pass the original image and the same image as conditioning
-        logits, _ = model(x, c=x, z=z_per_layer)  # (B, S-1, V)
+        logits, _ = model(x, c=x, z=z_per_layer)  # (B, S, V)
+        
+        # Teacher forcing: remove last logit position to align with shifted target
+        logits = logits[:, :-1, :]  # (B, S-1, V) - remove last position
 
         V = logits.size(-1)
-        recon_loss = F.cross_entropy(logits.reshape(-1, V), y_tgt.reshape(-1))
+        recon_loss = F.cross_entropy(logits.reshape(-1, V), y_tgt_shifted.reshape(-1))
         kl_loss = variational.kl_divergence(mu, log_var)
         
         # Add KL weight (β) to balance reconstruction and KL loss
@@ -159,13 +166,19 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
     # ---- 3) Slow step: optimize model beta with recon only ----
     generator_optimizer.zero_grad()
 
+    # Sample z_final with detached gradients (no gradients for mu, log_var)
     with torch.no_grad():
         mu_d, log_var_d = mu.detach(), log_var.detach()
         z_final = variational.sample_z(mu_d, log_var_d)
 
+    # Model forward pass WITHOUT no_grad() - we need gradients for the generator!
     logits, _ = model(x, c=x, z=z_final)
+    
+    # Teacher forcing: remove last logit position to align with shifted target
+    logits = logits[:, :-1, :]  # (B, S-1, V) - remove last position
+    
     V = logits.size(-1)
-    generator_loss = F.cross_entropy(logits.reshape(-1, V), y_tgt.reshape(-1))
+    generator_loss = F.cross_entropy(logits.reshape(-1, V), y_tgt_shifted.reshape(-1))
     generator_loss.backward()
     generator_optimizer.step()
 
@@ -177,7 +190,8 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
     )
 
 
-def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_optimizer, device, epoch, beta=0.1):
+def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_optimizer, device, epoch, beta=0.1,
+                kl_anneal_mode: str = "linear", kl_anneal_steps: int = 20000, global_step_start: int = 0):
     """Train for one epoch using variational algorithm"""
     model.train()
     total_loss = 0.0
@@ -187,6 +201,17 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
     num_batches = 0
     
     for batch_idx, batch in enumerate(dataloader):
+        # Compute annealed beta based on global step
+        global_step = global_step_start + batch_idx
+        if kl_anneal_mode == "linear" and kl_anneal_steps > 0:
+            beta_eff = min(beta * (global_step / kl_anneal_steps), beta)
+        elif kl_anneal_mode == "sigmoid" and kl_anneal_steps > 0:
+            import math
+            progress = min(max(global_step / kl_anneal_steps, 0.0), 1.0)
+            # smooth sigmoid from 0->beta
+            beta_eff = beta * (1.0 / (1.0 + math.exp(-12.0 * (progress - 0.5))))
+        else:
+            beta_eff = beta
         print(f"Epoch {epoch}, Batch {batch_idx+1}/{len(dataloader)}")
         
         # Move data to device
@@ -196,7 +221,7 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
         
         # Train batch with variational algorithm
         batch_loss, recon_loss, kl_loss, generator_loss = train_batch_variational(
-            model, batch, variational, eta_fast, T_fast, generator_optimizer, device, beta
+            model, batch, variational, eta_fast, T_fast, generator_optimizer, device, beta_eff
         )
         
         total_loss += batch_loss
@@ -205,7 +230,7 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
         total_generator += generator_loss
         num_batches += 1
         
-        print(f"  Batch Loss: {batch_loss:.4f}, Recon: {recon_loss:.4f}, KL: {kl_loss:.4f}, Generator: {generator_loss:.4f}")
+        print(f"  Batch Loss: {batch_loss:.4f}, Recon: {recon_loss:.4f}, KL: {kl_loss:.4f}, Generator: {generator_loss:.4f} (β_eff={beta_eff:.4f})")
     
     return (total_loss / num_batches, total_recon / num_batches, 
             total_kl / num_batches, total_generator / num_batches)
@@ -379,6 +404,9 @@ def main():
     parser.add_argument('--compress_checkpoints', action='store_true', default=True, help='Use compression for checkpoints (default: True)')
     parser.add_argument('--no_compress', action='store_true', help='Disable checkpoint compression')
     parser.add_argument('--beta', type=float, default=0.1, help='KL loss weight (β) for β-VAE (default: 0.1)')
+    parser.add_argument('--kl_anneal_mode', type=str, default='linear', choices=['linear','sigmoid','none','cyclical'], help='KL annealing schedule')
+    parser.add_argument('--kl_anneal_steps', type=int, default=20000, help='Steps to reach target β during annealing')
+    parser.add_argument('--kl_cycle_steps', type=int, default=0, help='If >0 and mode=cyclical, cycle length for β annealing')
     
     args = parser.parse_args()
     
@@ -477,16 +505,37 @@ def main():
         print(f"Previous training parameters: η_fast={checkpoint['eta_fast']}, η_slow={checkpoint['eta_slow']}, T_fast={checkpoint['T_fast']}")
     
     # Training loop
+    global_step = 0
     for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*60}")
         
         # Train epoch
+        # Handle cyclical annealing option by mapping global_step into cycles
+        anneal_mode = args.kl_anneal_mode
+        if anneal_mode == 'none':
+            anneal_mode_eff = 'none'
+            kl_steps_eff = args.kl_anneal_steps
+            global_step_for_epoch = global_step
+        elif anneal_mode == 'cyclical' and args.kl_cycle_steps > 0:
+            # Map position inside cycle and reuse linear schedule over the cycle
+            cycle_pos = global_step % args.kl_cycle_steps
+            anneal_mode_eff = 'linear'
+            kl_steps_eff = max(1, min(args.kl_anneal_steps, args.kl_cycle_steps))
+            global_step_for_epoch = cycle_pos
+        else:
+            anneal_mode_eff = anneal_mode
+            kl_steps_eff = args.kl_anneal_steps
+            global_step_for_epoch = global_step
+
         avg_loss, avg_recon, avg_kl, avg_generator = train_epoch(
-            model, train_dataloader, variational, eta_fast, T_fast, 
-            generator_optimizer, args.device, epoch+1, beta
+            model, train_dataloader, variational, eta_fast, T_fast,
+            generator_optimizer, args.device, epoch+1, beta,
+            kl_anneal_mode=anneal_mode_eff, kl_anneal_steps=kl_steps_eff, global_step_start=global_step_for_epoch
         )
+
+        global_step += len(train_dataloader)
         
         # Validate
         val_loss = validate_epoch(model, val_dataloader, args.device, epoch+1)

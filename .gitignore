@@ -1,0 +1,29 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Logs and generated outputs
+training.log
+training_*.log
+*.log
+quick_generated/
+quick_generated_*/
+latest_generated/
+
+# Checkpoints and large artifacts
+checkpoints*/
+*.ckpt
+*.pt
+pretrained/
+
+# Env and metadata
+.env
+.venv/
+*.egg-info/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db

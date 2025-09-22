@@ -169,6 +169,80 @@ class Net2NetTransformer(pl.LightningModule):
         return x
 
     @torch.no_grad()
+    def sample_with_latent(self, x, c, steps, z=None, temperature=1.0, sample=False, top_k=None,
+                           callback=lambda k: None, prior: str = "gaussian"):
+        """
+        Autoregressive sampling that conditions the transformer on a latent z.
+
+        Args:
+            x: LongTensor of shape (B, T_start) with already generated token indices (can be empty with T_start=0)
+            c: LongTensor of shape (B, T_cond) with conditioning token indices
+            steps: int, number of new tokens to generate
+            z: Optional FloatTensor of shape (B, L, z_dim). If None, it will be sampled from the specified prior.
+            temperature: float, softmax temperature
+            sample: bool, if True use multinomial sampling, else greedy
+            top_k: Optional[int], if set, restrict sampling to top-k logits
+            callback: callable(int), called each step k
+            prior: str, currently supports "gaussian" to draw z ~ N(0, I)
+
+        Returns:
+            LongTensor of shape (B, steps) with generated token indices
+        """
+        # Build the initial context by concatenating conditioning and generated prefix
+        x = torch.cat((c, x), dim=1)
+        block_size = self.transformer.get_block_size()
+        assert not self.transformer.training
+
+        # Prepare latent z if not provided
+        if z is None:
+            batch_size: int = x.shape[0]
+            num_layers: int = getattr(self.transformer, "L", None) or getattr(self.transformer.config, "n_layer", None)
+            z_dim: int = getattr(self.transformer, "z_dim", None) or getattr(self.transformer.config, "z_dim", None)
+            assert num_layers is not None and z_dim is not None, "Transformer must expose L and z_dim for latent sampling."
+            if prior == "gaussian":
+                z = torch.randn(batch_size, num_layers, z_dim, device=x.device, dtype=torch.float32)
+            else:
+                raise ValueError(f"Unsupported prior for latent sampling: {prior}")
+
+        if self.pkeep <= 0.0:
+            # One pass if inputs are pure noise anyway
+            assert len(x.shape) == 2
+            noise_shape = (x.shape[0], steps - 1)
+            noise = c.clone()[:, x.shape[1] - c.shape[1]:-1]
+            x = torch.cat((x, noise), dim=1)
+            logits, _ = self.transformer(x, z=z)
+            logits = logits / temperature
+            if top_k is not None:
+                logits = self.top_k_logits(logits, top_k)
+            probs = F.softmax(logits, dim=-1)
+            if sample:
+                shape = probs.shape
+                probs = probs.reshape(shape[0] * shape[1], shape[2])
+                ix = torch.multinomial(probs, num_samples=1)
+                probs = probs.reshape(shape[0], shape[1], shape[2])
+                ix = ix.reshape(shape[0], shape[1])
+            else:
+                _, ix = torch.topk(probs, k=1, dim=-1)
+            x = ix[:, c.shape[1] - 1:]
+        else:
+            for k in range(steps):
+                callback(k)
+                assert x.size(1) <= block_size
+                x_cond = x if x.size(1) <= block_size else x[:, -block_size:]
+                logits, _ = self.transformer(x_cond, z=z)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    logits = self.top_k_logits(logits, top_k)
+                probs = F.softmax(logits, dim=-1)
+                if sample:
+                    ix = torch.multinomial(probs, num_samples=1)
+                else:
+                    _, ix = torch.topk(probs, k=1, dim=-1)
+                x = torch.cat((x, ix), dim=1)
+            x = x[:, c.shape[1]:]
+        return x
+
+    @torch.no_grad()
     def encode_to_z(self, x):
         quant_z, _, info = self.first_stage_model.encode(x)
         indices = info[2].view(quant_z.shape[0], -1)

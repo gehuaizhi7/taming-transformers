@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 4.5e-06
+  base_learning_rate: 1e-5
   target: taming.models.cond_transformer.Net2NetTransformer
   params:
     unconditional: true  # Enable unconditional training
@@ -18,13 +18,13 @@ model:
     first_stage_config:
       target: taming.models.vqgan.VQModel
       params:
-        ckpt_path: pretrained/vqgan_imagenet_f16_16384.ckpt
+        ckpt_path: pretrained/vqgan_imagenet_f16_16384.ckpt  # Use pretrained ImageNet VQGAN
         embed_dim: 256
         n_embed: 16384
         ddconfig:
           double_z: false
           z_channels: 256
-          resolution: 256
+          resolution: 256  # Keep 256 for pretrained VQGAN
           in_channels: 3
           out_ch: 3
           ch: 128
@@ -36,35 +36,32 @@ model:
           - 4
           num_res_blocks: 2
           attn_resolutions:
-          - 16
+          - 16  # Keep 16 for pretrained VQGAN (256x256 -> 16x16)
           dropout: 0.0
         lossconfig:
           target: taming.modules.losses.DummyLoss
     cond_stage_config: "__is_unconditional__"  # Special flag for unconditional training
 
 variational:
-  eta_fast: 1e-3    # Fast learning rate for inference network (µ, σ)
-  eta_slow: 1e-4    # Slow learning rate for generator (β)
-  T_fast: 5         # Number of fast learning steps
+  eta_fast: 2e-3    # Increased from 1e-3 (2x increase)
+  eta_slow: 2e-4    # Increased from 1e-4 (2x increase)
+  T_fast: 12         # Increased from 5 (1.6x increase)
+  beta: 0.5         # KL loss weight (β-VAE parameter)
 
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 8    # Small batch size for testing
-    num_workers: 2   # Fewer workers for debugging
+    batch_size: 32  # Smaller batch size for 256x256 images
+    num_workers: 8
     train:
-      target: taming.data.celebahq_tiny.CelebAHQTinyTrain
+      target: taming.data.tiny_imagenet.TinyImageNetTrain
       params:
-        size: 256
+        data_path: data/tiny-imagenet-200
+        size: 256  # Resize to 256x256 for pretrained VQGAN
         crop_size: 256
     validation:
-      target: taming.data.celebahq_tiny.CelebAHQTinyValidation
+      target: taming.data.tiny_imagenet.TinyImageNetValidation
       params:
-        size: 256
+        data_path: data/tiny-imagenet-200
+        size: 256  # Resize to 256x256 for pretrained VQGAN
         crop_size: 256
-
-
-
-
-
-
