@@ -19,13 +19,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from omegaconf import OmegaConf
 import glob
 import shutil
 
 from taming.models.cond_transformer import Net2NetTransformer
 from taming.data.utils import custom_collate
+
+
+def is_main_process(rank: int) -> bool:
+    """Check if the current process is the main one."""
+    return rank == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model when wrapped by (D)DP."""
+    if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
+        return model.module
+    return model
 
 class VariationalInference:
     """Fast-learning variational params for one-z-per-layer: (B, L, z_dim)."""
@@ -114,16 +128,27 @@ def load_data_from_config(config_path, batch_size=None):
     return data_module
 
 
-def train_batch_variational(model, batch, variational, eta_fast, T_fast, generator_optimizer, device, beta=0.1):
+def train_batch_variational(
+    model,
+    batch,
+    variational,
+    eta_fast,
+    T_fast,
+    generator_optimizer,
+    device,
+    beta=0.1,
+    log_progress=True
+): 
     """Train a single batch using the variational algorithm"""
     model.train()
+    core_model = unwrap_model(model)
     # ---- 0) Data & tokens (do ONCE per batch) ----
     x = batch['image'].to(device)
     with torch.no_grad():
-        _, z_indices = model.encode_to_z(x)   # (B, S)
+        _, z_indices = core_model.encode_to_z(x)   # (B, S)
         cond_tokens = None
-        if hasattr(model, "encode_to_c"):
-            _, cond_tokens = model.encode_to_c(x)
+        if hasattr(core_model, "encode_to_c"):
+            _, cond_tokens = core_model.encode_to_c(x)
 
     # For unconditional training, use full sequence
     y_in  = z_indices  # full sequence as input
@@ -135,7 +160,7 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
     B = y_in.size(0)
 
     # ---- 1) Fast variables: mu, log_var for L layers ----
-    num_layers = model.transformer.L
+    num_layers = core_model.transformer.L
     mu, log_var = variational.initialize_params(batch_size=B)
     optimizer_fast = torch.optim.Adam([mu, log_var], lr=eta_fast)
 
@@ -160,7 +185,7 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
         loss.backward()
         optimizer_fast.step()
 
-        if (t % 2) == 0:
+        if log_progress and (t % 2) == 0:
             print(f"fast {t+1}/{T_fast} | total {loss.item():.4f}  recon {recon_loss.item():.4f}  KL {kl_loss.item():.4f} (β={beta})")
 
     # ---- 3) Slow step: optimize model beta with recon only ----
@@ -190,8 +215,23 @@ def train_batch_variational(model, batch, variational, eta_fast, T_fast, generat
     )
 
 
-def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_optimizer, device, epoch, beta=0.1,
-                kl_anneal_mode: str = "linear", kl_anneal_steps: int = 20000, global_step_start: int = 0):
+def train_epoch(
+    model,
+    dataloader,
+    variational,
+    eta_fast,
+    T_fast,
+    generator_optimizer,
+    device,
+    epoch,
+    beta=0.1,
+    kl_anneal_mode: str = "linear",
+    kl_anneal_steps: int = 20000,
+    global_step_start: int = 0,
+    train_sampler: DistributedSampler = None,
+    distributed: bool = False,
+    rank: int = 0
+):
     """Train for one epoch using variational algorithm"""
     model.train()
     total_loss = 0.0
@@ -200,6 +240,10 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
     total_generator = 0.0
     num_batches = 0
     
+    if train_sampler is not None:
+        # Distributed sampler expects epoch starting from 0
+        train_sampler.set_epoch(max(epoch - 1, 0))
+
     for batch_idx, batch in enumerate(dataloader):
         # Compute annealed beta based on global step
         global_step = global_step_start + batch_idx
@@ -212,7 +256,8 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
             beta_eff = beta * (1.0 / (1.0 + math.exp(-12.0 * (progress - 0.5))))
         else:
             beta_eff = beta
-        print(f"Epoch {epoch}, Batch {batch_idx+1}/{len(dataloader)}")
+        if is_main_process(rank):
+            print(f"Epoch {epoch}, Batch {batch_idx+1}/{len(dataloader)}")
         
         # Move data to device
         for key in batch:
@@ -221,7 +266,15 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
         
         # Train batch with variational algorithm
         batch_loss, recon_loss, kl_loss, generator_loss = train_batch_variational(
-            model, batch, variational, eta_fast, T_fast, generator_optimizer, device, beta_eff
+            model,
+            batch,
+            variational,
+            eta_fast,
+            T_fast,
+            generator_optimizer,
+            device,
+            beta_eff,
+            log_progress=is_main_process(rank)
         )
         
         total_loss += batch_loss
@@ -230,18 +283,48 @@ def train_epoch(model, dataloader, variational, eta_fast, T_fast, generator_opti
         total_generator += generator_loss
         num_batches += 1
         
-        print(f"  Batch Loss: {batch_loss:.4f}, Recon: {recon_loss:.4f}, KL: {kl_loss:.4f}, Generator: {generator_loss:.4f} (β_eff={beta_eff:.4f})")
+        if is_main_process(rank):
+            print(f"  Batch Loss: {batch_loss:.4f}, Recon: {recon_loss:.4f}, KL: {kl_loss:.4f}, Generator: {generator_loss:.4f} (β_eff={beta_eff:.4f})")
     
-    return (total_loss / num_batches, total_recon / num_batches, 
-            total_kl / num_batches, total_generator / num_batches)
+    if distributed:
+        stats_tensor = torch.tensor([
+            total_loss,
+            total_recon,
+            total_kl,
+            total_generator,
+            num_batches
+        ], device=device)
+        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        total_loss, total_recon, total_kl, total_generator, num_batches = stats_tensor.tolist()
+    
+    num_batches = max(num_batches, 1)
+    
+    return (
+        total_loss / num_batches,
+        total_recon / num_batches,
+        total_kl / num_batches,
+        total_generator / num_batches
+    )
 
 
-def validate_epoch(model, dataloader, device, epoch):
+def validate_epoch(
+    model,
+    dataloader,
+    device,
+    epoch,
+    val_sampler: DistributedSampler = None,
+    distributed: bool = False,
+    rank: int = 0
+):
     """Validate for one epoch (simplified for variational training)"""
     model.eval()
     total_loss = 0.0
     num_batches = 0
     
+    if val_sampler is not None:
+        # Keeps evaluation deterministic across processes
+        val_sampler.set_epoch(max(epoch - 1, 0))
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Move data to device and apply format conversion
@@ -252,7 +335,8 @@ def validate_epoch(model, dataloader, device, epoch):
             # Apply the same data format conversion as in training
             x = batch['image']
             # Debug: print tensor shape to understand the issue
-            print(f"Validation batch shape: {x.shape}")
+            if is_main_process(rank):
+                print(f"Validation batch shape: {x.shape}")
             
             # The data should already be in CHW format from the data loader
             # But let's ensure it's correct: (B, C, H, W) where C=3
@@ -268,13 +352,16 @@ def validate_epoch(model, dataloader, device, epoch):
                     if x.size(2) == 3:  # Channels are in position 2
                         x = x.permute(0, 2, 1, 3)  # Convert [B, H, C, W] to [B, C, H, W]
                         batch['image'] = x
+                    if is_main_process(rank):
                         print(f"Converted to CHW format: {x.shape}")
                     else:
-                        print(f"Cannot convert unexpected shape: {x.shape}")
+                        if is_main_process(rank):
+                            print(f"Cannot convert unexpected shape: {x.shape}")
                         continue  # Skip this batch
             
             # Double-check the final format
-            print(f"Final validation batch shape: {batch['image'].shape}")
+            if is_main_process(rank):
+                print(f"Final validation batch shape: {batch['image'].shape}")
             
             # Simple validation - call model directly to avoid get_input conversion
             x = batch['image'].to(device)
@@ -287,6 +374,12 @@ def validate_epoch(model, dataloader, device, epoch):
             total_loss += loss.item()
             num_batches += 1
     
+    if distributed:
+        stats_tensor = torch.tensor([total_loss, num_batches], device=device)
+        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        total_loss, num_batches = stats_tensor.tolist()
+
+    num_batches = max(num_batches, 1)
     return total_loss / num_batches
 
 
@@ -407,9 +500,13 @@ def main():
     parser.add_argument('--kl_anneal_mode', type=str, default='linear', choices=['linear','sigmoid','none','cyclical'], help='KL annealing schedule')
     parser.add_argument('--kl_anneal_steps', type=int, default=20000, help='Steps to reach target β during annealing')
     parser.add_argument('--kl_cycle_steps', type=int, default=0, help='If >0 and mode=cyclical, cycle length for β annealing')
+    parser.add_argument('--distributed', action='store_true', help='Enable DistributedDataParallel training')
+    parser.add_argument('--dist_backend', type=str, default='nccl', help='Backend to use for torch.distributed')
+    parser.add_argument('--sync_batchnorm', action='store_true', help='Convert BatchNorm layers to SyncBatchNorm when using DDP')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank when launched with torchrun/torch.distributed.launch')
     
     args = parser.parse_args()
-    
+
     # Load config first to get hyperparameters
     config = OmegaConf.load(args.config)
     
@@ -433,63 +530,162 @@ def main():
     
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
-    
-    print("Variational Training Algorithm")
-    print("=" * 50)
-    print(f"Config: {args.config}")
-    print(f"η_fast (fast learning rate): {eta_fast}")
-    print(f"η_slow (slow learning rate): {eta_slow}")
-    print(f"T_fast (fast learning steps): {T_fast}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Device: {args.device}")
+
+    def setup_device_and_distributed(runtime_args):
+        if not runtime_args.distributed:
+            try:
+                device_obj = torch.device(runtime_args.device)
+            except RuntimeError:
+                device_obj = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            runtime_args.rank = 0
+            runtime_args.world_size = 1
+            runtime_args.local_rank = 0
+            return device_obj
+
+        rank = int(os.environ.get('RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        local_rank_env = os.environ.get('LOCAL_RANK')
+        local_rank = int(local_rank_env) if local_rank_env is not None else runtime_args.local_rank
+        use_cuda = torch.cuda.is_available()
+
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device_obj = torch.device('cuda', local_rank)
+        else:
+            device_obj = torch.device('cpu')
+
+        dist.init_process_group(
+            backend=runtime_args.dist_backend,
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+        dist.barrier()
+
+        runtime_args.rank = rank
+        runtime_args.world_size = world_size
+        runtime_args.local_rank = local_rank
+        return device_obj
+
+    device = setup_device_and_distributed(args)
+    args.device = device
+
+    if is_main_process(getattr(args, 'rank', 0)):
+        print("Variational Training Algorithm")
+        print("=" * 50)
+        print(f"Config: {args.config}")
+        print(f"η_fast (fast learning rate): {eta_fast}")
+        print(f"η_slow (slow learning rate): {eta_slow}")
+        print(f"T_fast (fast learning steps): {T_fast}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Epochs: {args.epochs}")
+        print(f"Device: {device}")
+        if args.distributed:
+            print(f"Distributed: world_size={args.world_size}, rank={args.rank}, local_rank={args.local_rank}")
     
     # Load model
-    print("\nLoading model...")
+    if is_main_process(args.rank):
+        print("\nLoading model...")
     model = load_model_from_config(args.config, is_resume_checkpoint=bool(args.ckpt))
-    model = model.to(args.device)
-    
+    model = model.to(device)
+
+    if args.distributed and args.sync_batchnorm:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    if args.distributed:
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank] if device.type == 'cuda' else None,
+            output_device=args.local_rank if device.type == 'cuda' else None,
+            find_unused_parameters=True
+        )
+
     # Clear cache
-    torch.cuda.empty_cache()
-    
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     # Load data
-    print("Loading data...")
+    if is_main_process(args.rank):
+        print("Loading data...")
     data_module = load_data_from_config(args.config, args.batch_size)
     train_dataloader = data_module.train_dataloader()
     val_dataloader = data_module.val_dataloader()
-    
+
+    train_sampler = None
+    val_sampler = None
+
+    if args.distributed:
+        train_sampler = DistributedSampler(
+            train_dataloader.dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            drop_last=getattr(train_dataloader, 'drop_last', False)
+        )
+        train_dataloader = DataLoader(
+            train_dataloader.dataset,
+            batch_size=train_dataloader.batch_size,
+            sampler=train_sampler,
+            num_workers=train_dataloader.num_workers,
+            pin_memory=getattr(train_dataloader, 'pin_memory', False),
+            collate_fn=train_dataloader.collate_fn,
+            drop_last=getattr(train_dataloader, 'drop_last', False)
+        )
+
+        val_sampler = DistributedSampler(
+            val_dataloader.dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=False,
+            drop_last=False
+        )
+        val_dataloader = DataLoader(
+            val_dataloader.dataset,
+            batch_size=val_dataloader.batch_size,
+            sampler=val_sampler,
+            num_workers=val_dataloader.num_workers,
+            pin_memory=getattr(val_dataloader, 'pin_memory', False),
+            collate_fn=val_dataloader.collate_fn,
+            drop_last=False
+        )
+
     # Get model parameters for variational inference
-    L = model.transformer.L  # Number of z vectors (L)
+    model_core = unwrap_model(model)
+    L = model_core.transformer.L  # Number of z vectors (L)
     
     # Get z_dim from config
     z_dim = config.model.params.transformer_config.params.z_dim
     
     # Initialize variational inference
-    print("Initializing variational inference...")
-    variational = VariationalInference(L, z_dim, args.device)
-    
+    if is_main_process(args.rank):
+        print("Initializing variational inference...")
+    variational = VariationalInference(L, z_dim, device)
+
     # Setup generator optimizer (slow learning)
-    print("Setting up generator optimizer...")
+    if is_main_process(args.rank):
+        print("Setting up generator optimizer...")
     generator_params = []
-    for name, param in model.named_parameters():
+    for name, param in model_core.named_parameters():
         if 'transformer' in name:
             generator_params.append(param)
     
     generator_optimizer = optim.AdamW(generator_params, lr=eta_slow)
     
-    print(f"Model L (layers): {L}")
-    print(f"Z dimension: {z_dim}")
-    print(f"Train batches: {len(train_dataloader)}")
-    print(f"Val batches: {len(val_dataloader)}")
-    print(f"KL weight (β): {beta}")
+    if is_main_process(args.rank):
+        print(f"Model L (layers): {L}")
+        print(f"Z dimension: {z_dim}")
+        print(f"Train batches: {len(train_dataloader)}")
+        print(f"Val batches: {len(val_dataloader)}")
+        print(f"KL weight (β): {beta}")
     
     # Load checkpoint if provided
     start_epoch = 0
     best_loss = float('inf')
     
     if args.ckpt and os.path.exists(args.ckpt):
-        print(f"Loading checkpoint from {args.ckpt}")
-        checkpoint = torch.load(args.ckpt, map_location=args.device)
+        if is_main_process(args.rank):
+            print(f"Loading checkpoint from {args.ckpt}")
+        checkpoint = torch.load(args.ckpt, map_location=device)
         
         # Load model state
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -501,15 +697,17 @@ def main():
         start_epoch = checkpoint['epoch']
         best_loss = checkpoint['loss']
         
-        print(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
-        print(f"Previous training parameters: η_fast={checkpoint['eta_fast']}, η_slow={checkpoint['eta_slow']}, T_fast={checkpoint['T_fast']}")
+        if is_main_process(args.rank):
+            print(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+            print(f"Previous training parameters: η_fast={checkpoint['eta_fast']}, η_slow={checkpoint['eta_slow']}, T_fast={checkpoint['T_fast']}")
     
     # Training loop
     global_step = 0
     for epoch in range(start_epoch, args.epochs):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"{'='*60}")
+        if is_main_process(args.rank):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch+1}/{args.epochs}")
+            print(f"{'='*60}")
         
         # Train epoch
         # Handle cyclical annealing option by mapping global_step into cycles
@@ -530,28 +728,51 @@ def main():
             global_step_for_epoch = global_step
 
         avg_loss, avg_recon, avg_kl, avg_generator = train_epoch(
-            model, train_dataloader, variational, eta_fast, T_fast,
-            generator_optimizer, args.device, epoch+1, beta,
-            kl_anneal_mode=anneal_mode_eff, kl_anneal_steps=kl_steps_eff, global_step_start=global_step_for_epoch
+            model,
+            train_dataloader,
+            variational,
+            eta_fast,
+            T_fast,
+            generator_optimizer,
+            device,
+            epoch+1,
+            beta,
+            kl_anneal_mode=anneal_mode_eff,
+            kl_anneal_steps=kl_steps_eff,
+            global_step_start=global_step_for_epoch,
+            train_sampler=train_sampler,
+            distributed=args.distributed,
+            rank=args.rank
         )
 
         global_step += len(train_dataloader)
         
         # Validate
-        val_loss = validate_epoch(model, val_dataloader, args.device, epoch+1)
+        val_loss = validate_epoch(
+            model,
+            val_dataloader,
+            device,
+            epoch+1,
+            val_sampler=val_sampler,
+            distributed=args.distributed,
+            rank=args.rank
+        )
         
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  Average Loss: {avg_loss:.4f}")
-        print(f"  Average Reconstruction: {avg_recon:.4f}")
-        print(f"  Average KL: {avg_kl:.4f}")
-        print(f"  Average Generator: {avg_generator:.4f}")
-        print(f"  Validation Loss: {val_loss:.4f}")
-        
+        if is_main_process(args.rank):
+            print(f"\nEpoch {epoch+1} Summary:")
+            print(f"  Average Loss: {avg_loss:.4f}")
+            print(f"  Average Reconstruction: {avg_recon:.4f}")
+            print(f"  Average KL: {avg_kl:.4f}")
+            print(f"  Average Generator: {avg_generator:.4f}")
+            print(f"  Validation Loss: {val_loss:.4f}")
+
         # Show disk usage
-        show_disk_usage(args.save_dir)
-        
+        if is_main_process(args.rank):
+            show_disk_usage(args.save_dir)
+
         # Clear cache after each epoch
-        torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         import gc
         gc.collect()
         
@@ -565,7 +786,7 @@ def main():
         use_compression = args.compress_checkpoints and not args.no_compress
         
         # Save best model if improved
-        if avg_loss < best_loss:
+        if is_main_process(args.rank) and avg_loss < best_loss:
             best_loss = avg_loss
             save_optimized_checkpoint(
                 checkpoint_data, args.save_dir, epoch+1, 
@@ -581,11 +802,15 @@ def main():
             # Save every N epochs
             should_save_regular = (epoch + 1) % args.save_every == 0
         
-        if should_save_regular:
+        if should_save_regular and is_main_process(args.rank):
             save_optimized_checkpoint(
                 checkpoint_data, args.save_dir, epoch+1, 
                 is_best=False, max_checkpoints=args.max_checkpoints, compress=use_compression
             )
+
+    if args.distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

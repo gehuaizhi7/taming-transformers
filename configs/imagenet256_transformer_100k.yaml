@@ -51,17 +51,19 @@ variational:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 32  # Smaller batch size for 256x256 images
+    batch_size: 32
     num_workers: 8
     train:
-      target: taming.data.tiny_imagenet.TinyImageNetTrain
+      target: taming.data.imagenet256.ImageNet256Train
       params:
-        data_path: data/tiny-imagenet-200
+        data_path: data/imagenet-256
         size: 256  # Resize to 256x256 for pretrained VQGAN
         crop_size: 256
+        max_samples: 100000  # Use only first 100k images
     validation:
-      target: taming.data.tiny_imagenet.TinyImageNetValidation
+      target: taming.data.imagenet256.ImageNet256Validation
       params:
-        data_path: data/tiny-imagenet-200
+        data_path: data/imagenet-256
         size: 256  # Resize to 256x256 for pretrained VQGAN
         crop_size: 256
+        max_samples: 10000   # Use 10k images for validation

@@ -18,7 +18,7 @@ def quick_generate_tiny_imagenet_pretrained_vqgan():
     model = instantiate_from_config(config.model)
     
     # Load the trained checkpoint
-    checkpoint_path = "checkpoints_variational/best_model_epoch_11.pt"
+    checkpoint_path = "checkpoints_variational_cyclical/best_model_epoch_1.pt"
     print(f"Loading trained checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)

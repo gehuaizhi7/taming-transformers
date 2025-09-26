@@ -6,16 +6,15 @@
 echo "Starting optimized training with checkpoint management..."
 
 # Basic training with default settings (keeps 3 checkpoints, saves every 5 epochs)
+MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 RANK=0 WORLD_SIZE=1 \
 python train_custom.py \
     --config configs/tiny_imagenet_transformer.yaml \
     --epochs 50 \
     --max_checkpoints 3 \
     --save_every 1 \
-    --gpu_ids 4 \
-    --kl_anneal_mode cyclical \
-    --kl_anneal_steps 20000 \
-    --kl_cycle_steps 100000 \
-    --save_dir checkpoints_variational_cyclical
+    --kl_anneal_mode none \
+    --save_dir checkpoints_variational \
+    --distributed
 
 echo "Training completed!"
 
